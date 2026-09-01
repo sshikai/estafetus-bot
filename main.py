@@ -350,8 +350,11 @@ def start_estafeta(t, peer, silent=False):
     return True
 
 
-def resume_idle(peer):
-    for t in ("armor", "warehouse"):
+def resume_idle(peer, prefer=None):
+    types = ("armor", "warehouse")
+    if prefer in types:
+        types = (prefer, other_type(prefer))
+    for t in types:
         if get_setting(f"{t}_enabled", "0") != "1":
             continue
         e = get_estafeta(t)
@@ -391,7 +394,7 @@ def finish_estafeta(t, peer, reason="success"):
     update_estafeta(t, status="inactive", current_holder=None, started_at=None, waiting_until=0, pending_confirm=0)
 
     time.sleep(2)
-    resume_idle(peer)
+    resume_idle(peer, prefer=other_type(t))
 
 
 def enter_waiting(t, peer):
@@ -423,7 +426,7 @@ def confirm_waiting(t, peer, confirmed):
     update_estafeta(t, status="inactive", current_holder=None, started_at=None, waiting_until=0, pending_confirm=0)
 
     time.sleep(2)
-    resume_idle(peer)
+    resume_idle(peer, prefer=other_type(t))
 
 
 def fullers_text():
@@ -569,7 +572,7 @@ def timer_loop(peer):
                     elif e["status"] == "waiting":
                         if now >= e["waiting_until"]:
                             update_estafeta(t, status="inactive", waiting_until=0)
-                            resume_idle(peer)
+                            resume_idle(peer, prefer=t)
 
         except Exception as e:
             print("timer error:", e)
@@ -800,7 +803,7 @@ def handle_message(peer, sender, text, reply_from):
                 finish_estafeta("armor", peer, "admin_free")
             elif e and e["status"] == "waiting":
                 update_estafeta("armor", status="inactive", waiting_until=0)
-                resume_idle(peer)
+                resume_idle(peer, prefer="armor")
             else:
                 start_estafeta("armor", peer)
             send(peer, "Эстафета брони продолжена.")
@@ -810,7 +813,7 @@ def handle_message(peer, sender, text, reply_from):
                 finish_estafeta("warehouse", peer, "admin_free")
             elif e and e["status"] == "waiting":
                 update_estafeta("warehouse", status="inactive", waiting_until=0)
-                resume_idle(peer)
+                resume_idle(peer, prefer="warehouse")
             else:
                 start_estafeta("warehouse", peer)
             send(peer, "Эстафета склада продолжена.")
