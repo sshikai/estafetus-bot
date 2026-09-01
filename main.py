@@ -408,6 +408,9 @@ def enter_waiting(t, peer):
     update_estafeta(t, status="waiting", current_holder=None, started_at=None, waiting_until=wait_until, pending_confirm=0)
     send(peer, f"Принял! Отдыхаю {wait_mins} минут😴")
 
+    time.sleep(1)
+    resume_idle(peer, prefer=other_type(t))
+
 
 def confirm_waiting(t, peer, confirmed):
     e = get_estafeta(t)
