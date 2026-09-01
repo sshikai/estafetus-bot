@@ -316,16 +316,17 @@ def start_estafeta(t, peer):
         return
     
     mins = ARMOR_TIME // 60 if t == "armor" else WAREHOUSE_TIME // 60
-    what = "броню" if t == "armor" else "склад"
+    what_acc = "броню" if t == "armor" else "склад"
+    what_nom = "броня" if t == "armor" else "склад"
     
     update_estafeta(t, status="held", current_holder=user_id, started_at=int(time.time()), waiting_until=0, pending_confirm=0)
     open_log(user_id, t)
     
-    text = (f"{mention(user_id)}, твоя очередь фуллить {what}! 🎯\n"
+    text = (f"{mention(user_id)}, твоя очередь фуллить {what_acc}! 🎯\n"
             f"У тебя есть {mins} минут🕰️ чтобы успеть зафуллить.\n"
             f"Когда закончишь напиши !зафуллил. "
             f"Если желаешь отказаться напиши !пропускаю (+штраф).\n"
-            f"Если {what[:-1]} полная напиши !полный и бот перейдет в режим ожидания "
+            f"Если {what_nom} полная напиши !полный и бот перейдет в режим ожидания "
             f"(за ложное использование штраф 300к❗).")
     send(peer, text)
 
@@ -336,6 +337,15 @@ def finish_estafeta(t, peer, reason="success"):
         return
     
     holder = e["current_holder"]
+    
+    # Проверка на ложный фуллинг только для !зафуллил
+    if reason == "success":
+        elapsed = time.time() - e["started_at"]
+        if elapsed < FALSE_ALARM_TIME:
+            update_estafeta(t, pending_confirm=holder)
+            send(peer, f"Вы точно зафуллили? Напишите !Да или !Нет")
+            return
+    
     close_log(t, reason)
     
     if reason == "timeout":
@@ -360,18 +370,12 @@ def finish_estafeta(t, peer, reason="success"):
 
 
 def enter_waiting(t, peer):
-    wait_mins = ARMOR_WAIT // 60 if t == "armor" else WAREHOUSE_WAIT // 60
     e = get_estafeta(t)
     
     if e and e["status"] == "held" and e["current_holder"]:
-        holder = e["current_holder"]
-        elapsed = time.time() - e["started_at"]
-        if elapsed < FALSE_ALARM_TIME:
-            update_estafeta(t, pending_confirm=holder)
-            send(peer, f"Вы точно зафуллили? Напишите !Да или !Нет")
-            return
+        close_log(t, "режим ожидания")
     
-    close_log(t, "режим ожидания")
+    wait_mins = ARMOR_WAIT // 60 if t == "armor" else WAREHOUSE_WAIT // 60
     wait_until = int(time.time()) + (ARMOR_WAIT if t == "armor" else WAREHOUSE_WAIT)
     update_estafeta(t, status="waiting", current_holder=None, started_at=None, waiting_until=wait_until, pending_confirm=0)
     send(peer, f"Принял! Отдыхаю {wait_mins} минут😴")
@@ -383,16 +387,21 @@ def confirm_waiting(t, peer, confirmed):
         return
     
     holder = e["pending_confirm"]
-    close_log(t, "режим ожидания")
+    close_log(t, "успешно завершено")
     
     if not confirmed:
         change_penalty(holder, 1)
         send(peer, f"{mention(holder)} передумал и получил +1 штраф❗")
+    else:
+        send(peer, f"{mention(holder)} Молодец🙂")
     
-    wait_mins = ARMOR_WAIT // 60 if t == "armor" else WAREHOUSE_WAIT // 60
-    wait_until = int(time.time()) + (ARMOR_WAIT if t == "armor" else WAREHOUSE_WAIT)
-    update_estafeta(t, status="waiting", current_holder=None, started_at=None, waiting_until=wait_until, pending_confirm=0)
-    send(peer, f"Принял! Отдыхаю {wait_mins} минут😴")
+    update_estafeta(t, status="inactive", current_holder=None, started_at=None, waiting_until=0, pending_confirm=0)
+    
+    time.sleep(2)
+    
+    enabled = get_setting(f"{t}_enabled", "0") == "1"
+    if enabled:
+        start_estafeta(t, peer)
 
 
 def fullers_text():
