@@ -289,13 +289,13 @@ def mention(user_id):
     name = NAME_CACHE.get(user_id)
     if not name:
         name = "игрок"
-        try:
-            r = VK.users.get(user_ids=user_id)
-            if r:
-                name = (r[0].get("first_name", "") + " " + r[0].get("last_name", "")).strip() or "игрок"
-        except Exception:
-            pass
-        NAME_CACHE[user_id] = name
+    try:
+        r = VK.users.get(user_ids=user_id)
+        if r:
+            name = (r[0].get("first_name", "") + " " + r[0].get("last_name", "")).strip() or "игрок"
+    except Exception:
+        pass
+    NAME_CACHE[user_id] = name
     return f"[id{user_id}|{name}]"
 
 
@@ -377,7 +377,7 @@ def start_estafeta(t, peer, silent=False):
             f"У тебя есть {mins} минут🕰️ чтобы успеть зафуллить.\n"
             f"Когда закончишь напиши !зафуллил. "
             f"Если желаешь отказаться напиши !пропускаю (4 бесплатных пропуска в день 🎫, дальше +штраф).\n"
-            f"Если {what_nom} полная напиши !полный и бот перейдет в режим ожидания "
+            f"Если {what_nom} фулл напиши !полный и бот перейдет в режим ожидания "
             f"(за ложное использование штраф 300к❗).")
     send(peer, text)
     return True
@@ -419,10 +419,12 @@ def finish_estafeta(t, peer, reason="success", extra=None):
         send(peer, f"{mention(holder)} пропустил эстафету ✅ Бесплатный пропуск, осталось: {extra} 🎫")
     elif reason == "skip":
         send(peer, f"{mention(holder)} пропустил эстафету 😾 и получил +1 штраф❗ (пропуски кончились)")
+        change_penalty(holder, 1)
     elif reason == "success":
         send(peer, f"{mention(holder)} Молодец🙂")
     elif reason == "false_alarm":
         send(peer, f"{mention(holder)} сказал что фулл полный, но это оказалось ложью. +1 штраф❗")
+        change_penalty(holder, 1)
 
     update_estafeta(t, status="inactive", current_holder=None, started_at=None, waiting_until=0, pending_confirm=0)
 
