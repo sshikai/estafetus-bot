@@ -4,6 +4,7 @@ import time
 import random
 import sqlite3
 import threading
+from datetime import datetime, timezone, timedelta
 
 import vk_api
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
@@ -18,6 +19,9 @@ WAREHOUSE_TIME = int(os.environ.get("WAREHOUSE_TIME", "50")) * 60
 ARMOR_WAIT = int(os.environ.get("ARMOR_WAIT", "50")) * 60
 WAREHOUSE_WAIT = int(os.environ.get("WAREHOUSE_WAIT", "150")) * 60
 FALSE_ALARM_TIME = int(os.environ.get("FALSE_ALARM_TIME", "10")) * 60
+FREE_SKIPS = 4
+
+MSK = timezone(timedelta(hours=3))
 
 # ===== БАЗА ДАННЫХ =====
 DATA_DIR = "/app/data" if os.path.isdir("/app/data") else os.path.dirname(os.path.abspath(__file__))
@@ -57,6 +61,10 @@ def init_db():
             taken_at INTEGER,
             released_at INTEGER,
             reason TEXT)""")
+        CONN.execute("""CREATE TABLE IF NOT EXISTS skips (
+            user_id INTEGER PRIMARY KEY,
+            cnt INTEGER NOT NULL DEFAULT 4,
+            day TEXT)""")
         CONN.execute("INSERT OR IGNORE INTO estafeta(type,status) VALUES('armor','inactive')")
         CONN.execute("INSERT OR IGNORE INTO estafeta(type,status) VALUES('warehouse','inactive')")
         CONN.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('armor_enabled','0')")
@@ -83,6 +91,31 @@ def chat_peer():
         return int(get_setting("chat_peer_id", "0") or 0)
     except Exception:
         return 0
+
+
+def today_str():
+    return datetime.now(MSK).strftime("%Y-%m-%d")
+
+
+def get_skips(user_id):
+    with DB_LOCK:
+        row = CONN.execute("SELECT cnt, day FROM skips WHERE user_id=?", (user_id,)).fetchone()
+    if not row or row["day"] != today_str():
+        return FREE_SKIPS
+    return row["cnt"]
+
+
+def use_skip(user_id):
+    with DB_LOCK:
+        row = CONN.execute("SELECT cnt, day FROM skips WHERE user_id=?", (user_id,)).fetchone()
+        today = today_str()
+        cur = row["cnt"] if (row and row["day"] == today) else FREE_SKIPS
+        if cur <= 0:
+            return False
+        cur -= 1
+        CONN.execute("INSERT OR REPLACE INTO skips(user_id,cnt,day) VALUES(?,?,?)", (user_id, cur, today))
+        CONN.commit()
+        return True
 
 
 def get_extra_admins():
@@ -343,7 +376,7 @@ def start_estafeta(t, peer, silent=False):
     text = (f"{mention(user_id)}, твоя очередь фуллить {what_acc}! 🎯\n"
             f"У тебя есть {mins} минут🕰️ чтобы успеть зафуллить.\n"
             f"Когда закончишь напиши !зафуллил. "
-            f"Если желаешь отказаться напиши !пропускаю (+штраф).\n"
+            f"Если желаешь отказаться напиши !пропускаю (4 бесплатных пропуска в день 🎫, дальше +штраф).\n"
             f"Если {what_nom} полная напиши !полный и бот перейдет в режим ожидания "
             f"(за ложное использование штраф 300к❗).")
     send(peer, text)
@@ -362,7 +395,7 @@ def resume_idle(peer, prefer=None):
             start_estafeta(t, peer, silent=True)
 
 
-def finish_estafeta(t, peer, reason="success"):
+def finish_estafeta(t, peer, reason="success", extra=None):
     e = get_estafeta(t)
     if not e or e["status"] != "held":
         return
@@ -382,14 +415,14 @@ def finish_estafeta(t, peer, reason="success"):
     if reason == "timeout":
         send(peer, f"❌{mention(holder)} не зафуллил за отведенное время. Ему выдается штраф.❌")
         change_penalty(holder, 1)
+    elif reason == "skip_free":
+        send(peer, f"{mention(holder)} пропустил эстафету ✅ Бесплатный пропуск, осталось: {extra} 🎫")
     elif reason == "skip":
-        send(peer, f"{mention(holder)} пропустил эстафету 😾 и получил +1 штраф❗")
-        change_penalty(holder, 1)
+        send(peer, f"{mention(holder)} пропустил эстафету 😾 и получил +1 штраф❗ (пропуски кончились)")
     elif reason == "success":
         send(peer, f"{mention(holder)} Молодец🙂")
     elif reason == "false_alarm":
         send(peer, f"{mention(holder)} сказал что фулл полный, но это оказалось ложью. +1 штраф❗")
-        change_penalty(holder, 1)
 
     update_estafeta(t, status="inactive", current_holder=None, started_at=None, waiting_until=0, pending_confirm=0)
 
@@ -432,6 +465,57 @@ def confirm_waiting(t, peer, confirmed):
     resume_idle(peer, prefer=other_type(t))
 
 
+def stop_relays(peer):
+    for t in ("armor", "warehouse"):
+        set_setting(f"{t}_enabled", "0")
+        e = get_estafeta(t)
+        if e and e["status"] == "held":
+            finish_estafeta(t, peer, "admin_stop")
+        elif e and e["status"] == "waiting":
+            update_estafeta(t, status="inactive", waiting_until=0)
+
+
+def start_relays(peer):
+    for t in ("armor", "warehouse"):
+        set_setting(f"{t}_enabled", "1")
+    resume_idle(peer)
+
+
+def check_schedule(peer):
+    now = datetime.now(MSK)
+    today = now.strftime("%Y-%m-%d")
+    on_h = int(get_setting("sched_on", "9"))
+    off_h = int(get_setting("sched_off", "22"))
+    h = now.hour
+
+    if on_h < off_h:
+        in_window = on_h <= h < off_h
+    else:
+        in_window = (h >= on_h) or (h < off_h)
+
+    if in_window:
+        if get_setting("last_on_date", "") != today:
+            set_setting("last_on_date", today)
+            changed = False
+            for t in ("armor", "warehouse"):
+                if get_setting(f"{t}_enabled", "0") != "1":
+                    set_setting(f"{t}_enabled", "1")
+                    changed = True
+            if changed:
+                send(peer, f"🌅 Эстафеты включены по расписанию ({on_h}:00 МСК)!")
+                resume_idle(peer)
+    else:
+        if get_setting("last_off_date", "") != today:
+            set_setting("last_off_date", today)
+            changed = False
+            for t in ("armor", "warehouse"):
+                if get_setting(f"{t}_enabled", "0") == "1":
+                    changed = True
+            if changed:
+                stop_relays(peer)
+                send(peer, f"🌙 Эстафеты выключены по расписанию ({off_h}:00 МСК). До завтра! 😴")
+
+
 def fullers_text():
     armor = get_fullers("armor")
     warehouse = get_fullers("warehouse")
@@ -449,6 +533,19 @@ def fullers_text():
     else:
         lines.append("(пусто)")
 
+    return "\n".join(lines)
+
+
+def skips_text():
+    ids = []
+    for u in get_fullers("armor") + get_fullers("warehouse"):
+        if u not in ids:
+            ids.append(u)
+    if not ids:
+        return "Фуллеров пока нет 🤷"
+    lines = ["🎫 Бесплатные пропуски на сегодня:"]
+    for u in ids:
+        lines.append(f"{mention(u)} — {get_skips(u)} из {FREE_SKIPS}")
     return "\n".join(lines)
 
 
@@ -518,11 +615,12 @@ def help_text(admin, owner):
          "!статус — текущий статус эстафет 📊\n"
          "!штрафы — список штрафов 💰\n"
          "!фуллеры — списки фуллеров 👥\n"
+         "!скипы — бесплатные пропуски фуллеров 🎫\n"
          "!админы — кто является администратором 👑\n"
          "!помощь — список команд ℹ️\n\n"
          "🎮 **Команды эстафеты:**\n"
          "!зафуллил — передать эстафету следующему ✅\n"
-         "!пропускаю — пропустить эстафету (+штраф) ⏭️\n"
+         "!пропускаю — пропустить (4 бесплатных в день, дальше +штраф) ⏭️\n"
          "!полный — перейти в режим ожидания 😴")
 
     if admin:
@@ -531,6 +629,7 @@ def help_text(admin, owner):
               "!старт броня — включить эстафету брони ▶️\n"
               "!стоп склад — выключить эстафету склада 🛑\n"
               "!старт склад — включить эстафету склада ▶️\n"
+              "!таймер Ч Ч — расписание авто-вкл/выкл (по МСК) ⏰\n"
               "!лог @ — лог конкретного человека 📝\n"
               "!очистить штрафы @ или всем — очистить штрафы 🧹\n"
               "!штраф всем — штраф всем фуллерам ⚡\n"
@@ -552,12 +651,14 @@ def help_text(admin, owner):
     return t
 
 
-def timer_loop(peer):
+def timer_loop():
     while True:
         try:
+            peer = chat_peer()
             if peer and VK is not None:
-                now = time.time()
+                check_schedule(peer)
 
+                now = time.time()
                 for t in ("armor", "warehouse"):
                     enabled = get_setting(f"{t}_enabled", "0") == "1"
                     if not enabled:
@@ -626,6 +727,9 @@ def handle_message(peer, sender, text, reply_from):
     if cmd == "!фуллеры":
         send(peer, fullers_text()); return
 
+    if cmd == "!скипы":
+        send(peer, skips_text()); return
+
     if cmd == "!статус":
         send(peer, status_text()); return
 
@@ -646,7 +750,10 @@ def handle_message(peer, sender, text, reply_from):
         for t in ("armor", "warehouse"):
             e = get_estafeta(t)
             if e and e["status"] == "held" and e["current_holder"] == sender:
-                finish_estafeta(t, peer, "skip")
+                if use_skip(sender):
+                    finish_estafeta(t, peer, "skip_free", extra=get_skips(sender))
+                else:
+                    finish_estafeta(t, peer, "skip")
                 return
         send(peer, "Сейчас нет активной эстафеты на вас.")
         return
@@ -681,6 +788,26 @@ def handle_message(peer, sender, text, reply_from):
         set_setting("chat_peer_id", str(peer))
         send(peer, "Чат перепривязан."); return
 
+    if cmd == "!таймер":
+        if not admin: return deny()
+        parts = first.split()
+        if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+            on_h = int(parts[1])
+            off_h = int(parts[2])
+            if 0 <= on_h <= 23 and 0 <= off_h <= 23 and on_h != off_h:
+                set_setting("sched_on", str(on_h))
+                set_setting("sched_off", str(off_h))
+                set_setting("last_on_date", "")
+                set_setting("last_off_date", "")
+                send(peer, f"⏰ Расписание установлено: включение в {on_h}:00, выключение в {off_h}:00 по МСК.")
+            else:
+                send(peer, "Часы должны быть от 0 до 23 и отличаться между собой.")
+        else:
+            on_h = get_setting("sched_on", "9")
+            off_h = get_setting("sched_off", "22")
+            send(peer, f"⏰ Текущее расписание: включение в {on_h}:00, выключение в {off_h}:00 по МСК.\nИзменить: !таймер час_вкл час_выкл")
+        return
+
     if cmd == "!стоп":
         if not admin: return deny()
         if "броня" in first or "броню" in first:
@@ -690,7 +817,7 @@ def handle_message(peer, sender, text, reply_from):
                 finish_estafeta("armor", peer, "admin_stop")
             else:
                 update_estafeta("armor", status="inactive")
-            send(peer, "Эстафета брони выключена.")
+            send(peer, "Эстафета брони выключена 🛑")
         elif "склад" in first:
             set_setting("warehouse_enabled", "0")
             e = get_estafeta("warehouse")
@@ -698,7 +825,7 @@ def handle_message(peer, sender, text, reply_from):
                 finish_estafeta("warehouse", peer, "admin_stop")
             else:
                 update_estafeta("warehouse", status="inactive")
-            send(peer, "Эстафета склада выключена.")
+            send(peer, "Эстафета склада выключена 🛑")
         return
 
     if cmd == "!старт":
@@ -707,19 +834,19 @@ def handle_message(peer, sender, text, reply_from):
             set_setting("armor_enabled", "1")
             e = get_estafeta("armor")
             if e and e["status"] == "held":
-                send(peer, "Эстафета брони включена (текущая продолжается).")
+                send(peer, "Эстафета брони включена (текущая продолжается) ▶️")
             else:
                 update_estafeta("armor", status="inactive", waiting_until=0, pending_confirm=0)
-                send(peer, "Эстафета брони включена.")
+                send(peer, "Эстафета брони включена ▶️")
                 start_estafeta("armor", peer)
         elif "склад" in first:
             set_setting("warehouse_enabled", "1")
             e = get_estafeta("warehouse")
             if e and e["status"] == "held":
-                send(peer, "Эстафета склада включена (текущая продолжается).")
+                send(peer, "Эстафета склада включена (текущая продолжается) ▶️")
             else:
                 update_estafeta("warehouse", status="inactive", waiting_until=0, pending_confirm=0)
-                send(peer, "Эстафета склада включена.")
+                send(peer, "Эстафета склада включена ▶️")
                 start_estafeta("warehouse", peer)
         return
 
@@ -736,16 +863,16 @@ def handle_message(peer, sender, text, reply_from):
         if not admin: return deny()
         if "всем" in first or "всём" in first:
             clear_penalties_all()
-            send(peer, "Все штрафы очищены.")
+            send(peer, "Все штрафы очищены 🧹")
         else:
             targets = extract_targets(text, reply_from)
             if targets:
                 for t in targets:
                     clear_penalty_user(t)
-                send(peer, "Штрафы очищены у указанных игроков.")
+                send(peer, "Штрафы очищены у указанных игроков 🧹")
             else:
                 clear_penalties_all()
-                send(peer, "Все штрафы очищены.")
+                send(peer, "Все штрафы очищены 🧹")
         return
 
     if first.startswith("!штраф всем") or first.startswith("!штраф_всем"):
@@ -758,7 +885,7 @@ def handle_message(peer, sender, text, reply_from):
         for uid in set(fullers):
             cnt = change_penalty(uid, 1)
             lines.append(f"{mention(uid)} — всего: {cnt}")
-        send(peer, "Штраф +1 выдан всем фуллерам:\n" + "\n".join(lines))
+        send(peer, "Штраф +1 выдан всем фуллерам ⚡\n" + "\n".join(lines))
         return
 
     if first.startswith("+штраф"):
@@ -771,7 +898,7 @@ def handle_message(peer, sender, text, reply_from):
         for t in targets:
             cnt = change_penalty(t, 1)
             lines.append(f"{mention(t)} — всего: {cnt}")
-        send(peer, "Штраф +1 выдан:\n" + "\n".join(lines))
+        send(peer, "Штраф +1 выдан ➕\n" + "\n".join(lines))
         return
 
     if first.startswith("-штраф"):
@@ -784,7 +911,7 @@ def handle_message(peer, sender, text, reply_from):
         for t in targets:
             cnt = change_penalty(t, -1)
             lines.append(f"{mention(t)} — всего: {cnt}")
-        send(peer, "Штраф -1 снят:\n" + "\n".join(lines))
+        send(peer, "Штраф -1 снят ➖\n" + "\n".join(lines))
         return
 
     if first.startswith("!ложный"):
@@ -795,7 +922,7 @@ def handle_message(peer, sender, text, reply_from):
             return
         for t in targets:
             change_penalty(t, 10)
-        send(peer, f"Выдано по 10 штрафов: {', '.join(mention(t) for t in targets)}")
+        send(peer, f"Выдано по 10 штрафов 🔥 {', '.join(mention(t) for t in targets)}")
         return
 
     if first.startswith("!освободить"):
@@ -809,7 +936,7 @@ def handle_message(peer, sender, text, reply_from):
                 resume_idle(peer, prefer="armor")
             else:
                 start_estafeta("armor", peer)
-            send(peer, "Эстафета брони продолжена.")
+            send(peer, "Эстафета брони продолжена ⏩")
         elif "склад" in first:
             e = get_estafeta("warehouse")
             if e and e["status"] == "held":
@@ -819,13 +946,13 @@ def handle_message(peer, sender, text, reply_from):
                 resume_idle(peer, prefer="warehouse")
             else:
                 start_estafeta("warehouse", peer)
-            send(peer, "Эстафета склада продолжена.")
+            send(peer, "Эстафета склада продолжена ⏩")
         return
 
     if first.startswith("!очистить лог") or first.startswith("!очистить_лог"):
         if not admin: return deny()
         clear_log_all()
-        send(peer, "Лог очищен.")
+        send(peer, "Лог очищен 🗑️")
         return
 
     if first.startswith("+фуллер"):
@@ -841,7 +968,8 @@ def handle_message(peer, sender, text, reply_from):
             add_fuller(t, u)
         if added:
             what = "брони" if t == "armor" else "склада"
-            send(peer, f"Добавлены фуллеры {what}: {', '.join(mention(u) for u in added)}")
+            send(peer, f"Добавлены фуллеры {what} ➕ {', '.join(mention(u) for u in added)}")
+            resume_idle(peer)
         else:
             send(peer, "Эти игроки уже в списке.")
         return
@@ -859,7 +987,7 @@ def handle_message(peer, sender, text, reply_from):
             remove_fuller(t, u)
         if removed:
             what = "брони" if t == "armor" else "склада"
-            send(peer, f"Удалены фуллеры {what}: {', '.join(mention(u) for u in removed)}")
+            send(peer, f"Удалены фуллеры {what} ➖ {', '.join(mention(u) for u in removed)}")
         else:
             send(peer, "Этих игроков нет в списке.")
         return
@@ -922,6 +1050,9 @@ def main():
     while not VK_TOKEN:
         time.sleep(60)
 
+    # Таймер запускается ОДИН раз и всегда смотрит актуальный привязанный чат
+    threading.Thread(target=timer_loop, daemon=True).start()
+
     while True:
         try:
             session = vk_api.VkApi(token=VK_TOKEN)
@@ -929,10 +1060,6 @@ def main():
             group_id = VK.groups.getById()[0]["id"]
             longpoll = VkBotLongPoll(session, group_id)
             print("Bot started, group id:", group_id)
-
-            peer = chat_peer()
-            if peer:
-                threading.Thread(target=timer_loop, args=(peer,), daemon=True).start()
 
             for event in longpoll.listen():
                 if event.type != VkBotEventType.MESSAGE_NEW:
