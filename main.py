@@ -44,7 +44,8 @@ def init_db():
             current_holder INTEGER,
             started_at INTEGER,
             waiting_until INTEGER,
-            pending_confirm INTEGER DEFAULT 0)""")
+            pending_confirm INTEGER DEFAULT 0,
+            confirm_type TEXT DEFAULT '')""")
         CONN.execute("""CREATE TABLE IF NOT EXISTS fullers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             type TEXT,
@@ -71,6 +72,11 @@ def init_db():
         CONN.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('warehouse_enabled','0')")
         CONN.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('armor_index','0')")
         CONN.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('warehouse_index','0')")
+        # Миграция: добавляем столбец если его нет
+        try:
+            CONN.execute("ALTER TABLE estafeta ADD COLUMN confirm_type TEXT DEFAULT ''")
+        except Exception:
+            pass
         CONN.commit()
 
 
@@ -370,7 +376,7 @@ def start_estafeta(t, peer, silent=False):
     what_acc = "броню" if t == "armor" else "склад"
     what_nom = "броня" if t == "armor" else "склад"
 
-    update_estafeta(t, status="held", current_holder=user_id, started_at=int(time.time()), waiting_until=0, pending_confirm=0)
+    update_estafeta(t, status="held", current_holder=user_id, started_at=int(time.time()), waiting_until=0, pending_confirm=0, confirm_type="")
     open_log(user_id, t)
 
     text = (f"{mention(user_id)}, твоя очередь фуллить {what_acc}! 🎯\n"
@@ -395,21 +401,41 @@ def resume_idle(peer, prefer=None):
             start_estafeta(t, peer, silent=True)
 
 
-def finish_estafeta(t, peer, reason="success", extra=None):
+def finish_and_wait(t, peer, check_time=True):
     e = get_estafeta(t)
     if not e or e["status"] != "held":
         return
 
     holder = e["current_holder"]
 
-    # Проверка на ложный фуллинг только для !зафуллил
-    if reason == "success":
+    if check_time:
         elapsed = time.time() - e["started_at"]
         if elapsed < FALSE_ALARM_TIME:
-            update_estafeta(t, pending_confirm=holder)
-            send(peer, "Вы точно зафуллили? Напишите !Да или !Нет")
+            update_estafeta(t, pending_confirm=holder, confirm_type="full")
+            mins_passed = int(elapsed // 60)
+            send(peer, f"🤔 {mention(holder)}, ты зафуллил всего за {mins_passed} мин. Ты точно всё зафуллил?\nНапишите !Да или !Нет")
             return
 
+    close_log(t, "успешно зафуллил")
+
+    wait_mins = ARMOR_WAIT // 60 if t == "armor" else WAREHOUSE_WAIT // 60
+    what = "Броня" if t == "armor" else "Склад"
+    emoji = "🛡️" if t == "armor" else "📦"
+    send(peer, f"🎉 Молодец! {emoji} {what} фулл. Перехожу в режим ожидания на {wait_mins} минут 😴💤")
+
+    wait_until = int(time.time()) + (ARMOR_WAIT if t == "armor" else WAREHOUSE_WAIT)
+    update_estafeta(t, status="waiting", current_holder=None, started_at=None, waiting_until=wait_until, pending_confirm=0, confirm_type="")
+
+    time.sleep(1)
+    resume_idle(peer, prefer=other_type(t))
+
+
+def finish_estafeta(t, peer, reason="success", extra=None):
+    e = get_estafeta(t)
+    if not e or e["status"] != "held":
+        return
+
+    holder = e["current_holder"]
     close_log(t, reason)
 
     if reason == "timeout":
@@ -426,7 +452,7 @@ def finish_estafeta(t, peer, reason="success", extra=None):
         send(peer, f"{mention(holder)} сказал что фулл полный, но это оказалось ложью. +1 штраф❗")
         change_penalty(holder, 1)
 
-    update_estafeta(t, status="inactive", current_holder=None, started_at=None, waiting_until=0, pending_confirm=0)
+    update_estafeta(t, status="inactive", current_holder=None, started_at=None, waiting_until=0, pending_confirm=0, confirm_type="")
 
     time.sleep(2)
     resume_idle(peer, prefer=other_type(t))
@@ -440,7 +466,7 @@ def enter_waiting(t, peer):
 
     wait_mins = ARMOR_WAIT // 60 if t == "armor" else WAREHOUSE_WAIT // 60
     wait_until = int(time.time()) + (ARMOR_WAIT if t == "armor" else WAREHOUSE_WAIT)
-    update_estafeta(t, status="waiting", current_holder=None, started_at=None, waiting_until=wait_until, pending_confirm=0)
+    update_estafeta(t, status="waiting", current_holder=None, started_at=None, waiting_until=wait_until, pending_confirm=0, confirm_type="")
     send(peer, f"Принял! Отдыхаю {wait_mins} минут😴")
 
     time.sleep(1)
@@ -453,18 +479,28 @@ def confirm_waiting(t, peer, confirmed):
         return
 
     holder = e["pending_confirm"]
-    close_log(t, "успешно завершено")
 
-    if not confirmed:
-        change_penalty(holder, 1)
-        send(peer, f"{mention(holder)} передумал и получил +1 штраф❗")
+    # Сбросить pending
+    update_estafeta(t, status="inactive", current_holder=None, started_at=None, waiting_until=0, pending_confirm=0, confirm_type="")
+
+    if confirmed:
+        # Подтвердил — уход в ожидание (как успешный !зафуллил)
+        close_log(t, "успешно зафуллил")
+        wait_mins = ARMOR_WAIT // 60 if t == "armor" else WAREHOUSE_WAIT // 60
+        what = "Броня" if t == "armor" else "Склад"
+        emoji = "🛡️" if t == "armor" else "📦"
+        send(peer, f"🎉 Принято! {emoji} {what} фулл. Перехожу в режим ожидания на {wait_mins} минут 😴💤")
+        wait_until = int(time.time()) + (ARMOR_WAIT if t == "armor" else WAREHOUSE_WAIT)
+        update_estafeta(t, status="waiting", waiting_until=wait_until)
+        time.sleep(1)
+        resume_idle(peer, prefer=other_type(t))
     else:
-        send(peer, f"{mention(holder)} Молодец🙂")
-
-    update_estafeta(t, status="inactive", current_holder=None, started_at=None, waiting_until=0, pending_confirm=0)
-
-    time.sleep(2)
-    resume_idle(peer, prefer=other_type(t))
+        # Отказался — штраф и передача дальше
+        close_log(t, "отказался после подтверждения")
+        send(peer, f"❌ {mention(holder)} отказался и получил +1 штраф❗")
+        change_penalty(holder, 1)
+        time.sleep(2)
+        resume_idle(peer, prefer=other_type(t))
 
 
 def stop_relays(peer):
@@ -621,7 +657,7 @@ def help_text(admin, owner):
          "!админы — кто является администратором 👑\n"
          "!помощь — список команд ℹ️\n\n"
          "🎮 **Команды эстафеты:**\n"
-         "!зафуллил — передать эстафету следующему ✅\n"
+         "!зафуллил — зафуллил, бот уходит в ожидание 🎉\n"
          "!пропускаю — пропустить (4 бесплатных в день, дальше +штраф) ⏭️\n"
          "!полный — перейти в режим ожидания 😴")
 
@@ -632,6 +668,7 @@ def help_text(admin, owner):
               "!стоп склад — выключить эстафету склада 🛑\n"
               "!старт склад — включить эстафету склада ▶️\n"
               "!таймер Ч Ч — расписание авто-вкл/выкл (по МСК) ⏰\n"
+              "!принудить б/с @ — принудительно передать эстафету ⚡\n"
               "!лог @ — лог конкретного человека 📝\n"
               "!очистить штрафы @ или всем — очистить штрафы 🧹\n"
               "!штраф всем — штраф всем фуллерам ⚡\n"
@@ -743,7 +780,7 @@ def handle_message(peer, sender, text, reply_from):
         for t in ("armor", "warehouse"):
             e = get_estafeta(t)
             if e and e["status"] == "held" and e["current_holder"] == sender:
-                finish_estafeta(t, peer, "success")
+                finish_and_wait(t, peer, check_time=True)
                 return
         send(peer, "Сейчас нет активной эстафеты на вас.")
         return
@@ -808,6 +845,40 @@ def handle_message(peer, sender, text, reply_from):
             on_h = get_setting("sched_on", "9")
             off_h = get_setting("sched_off", "22")
             send(peer, f"⏰ Текущее расписание: включение в {on_h}:00, выключение в {off_h}:00 по МСК.\nИзменить: !таймер час_вкл час_выкл")
+        return
+
+    if cmd == "!принудить":
+        if not admin: return deny()
+        t = "armor" if "б" in first else "warehouse"
+        targets = extract_targets(text, reply_from)
+        if not targets:
+            send(peer, f"Укажите игрока: !принудить {'б' if t == 'armor' else 'с'} @юзер")
+            return
+        user_id = targets[0]
+        fullers = get_fullers(t)
+        what = "брони" if t == "armor" else "склада"
+        if user_id not in fullers:
+            send(peer, f"⚠️ {mention(user_id)} не в списке фуллеров {what}.")
+            return
+        # Проверка: не занят ли другой эстафетой
+        oe = get_estafeta(other_type(t))
+        if oe and oe["status"] == "held" and oe["current_holder"] == user_id:
+            send(peer, f"⚠️ {mention(user_id)} сейчас занят другой эстафетой, принудительная передача невозможна.")
+            return
+        # Освободить текущую эстафету если есть
+        e = get_estafeta(t)
+        if e and e["status"] == "held":
+            old_holder = e["current_holder"]
+            close_log(t, "освобождена админом (принудительно)")
+            update_estafeta(t, status="inactive", current_holder=None, started_at=None, waiting_until=0, pending_confirm=0, confirm_type="")
+        elif e and e["status"] == "waiting":
+            update_estafeta(t, status="inactive", waiting_until=0)
+        # Поставить индекс на целевого человека
+        idx = fullers.index(user_id)
+        set_setting(f"{t}_index", str(idx))
+        # Запустить эстафету
+        send(peer, f"⚡ Эстафета {what} принудительно передана {mention(user_id)}")
+        start_estafeta(t, peer)
         return
 
     if cmd == "!стоп":
